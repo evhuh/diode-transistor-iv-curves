@@ -147,27 +147,48 @@ def plot_gm_vs_vgs(gm_df: pd.DataFrame, title=""):
 
 
 # MOSFET – Extract Vt and k from linear region
-def extract_mos_linear_params(df: pd.DataFrame, vds_max_linear=0.1):
+def extract_mos_linear_params_clean(df: pd.DataFrame,
+                                    vds_max_linear=0.15,
+                                    vgs_good_range=(0.25, 3.25),
+                                    min_points=3):
     """
-    Fit slopes m = dId/dVds at small Vds for each Vgs.
-    slopes ≈ k * (Vgs - Vt)
-    Fit slope vs Vgs to extract k and Vt.
+    - Uses only VDS < vds_max_linear (true linear region)
+    - Filters out known-glitch VGS values
+    - Uses a low Id threshold appropriate for your dataset
+    - Requires at least min_points per linear fit
     """
     slopes = []
     vgs_vals = []
 
+    vgs_min, vgs_max = vgs_good_range
+
     for vgs, grp in df.groupby("Vgs"):
-        lin = grp[grp["Vds"] <= vds_max_linear]
-        if len(lin) < 3:
+        if not (vgs_min <= vgs <= vgs_max):
             continue
+
+        lin = grp[grp["Vds"] <= vds_max_linear]
+
+        # very small threshold—your data is small in this region
+        lin = lin[lin["Id"] > 1e-9]
+
+        if len(lin) < min_points:
+            continue
+
+        # perform linear fit
         m, b = np.polyfit(lin["Vds"], lin["Id"], 1)
+
+        if m <= 0:
+            continue
+
         slopes.append(m)
         vgs_vals.append(vgs)
 
-    vgs_vals = np.array(vgs_vals)
     slopes = np.array(slopes)
+    vgs_vals = np.array(vgs_vals)
 
-    # slope = k*Vgs - k*Vt
+    if len(slopes) < 2:
+        raise ValueError("No valid slopes detected for linear region extraction.")
+
     k_lin, intercept = np.polyfit(vgs_vals, slopes, 1)
     vt_lin = -intercept / k_lin
 
@@ -175,25 +196,31 @@ def extract_mos_linear_params(df: pd.DataFrame, vds_max_linear=0.1):
 
 
 # MOSFET – Extract Vt and k from saturation region
-def extract_mos_sat_params(df: pd.DataFrame, vds_min_sat=1.0):
-    """
-    Use highest Vds ≥ vds_min_sat to approximate Id_sat for each Vgs.
-    Then fit sqrt(Id_sat) vs Vgs to get Vt and k.
-    """
+def extract_mos_sat_params_clean(df: pd.DataFrame,
+                                 vds_min_sat=2.0,
+                                 vgs_good_range=(0.25, 3.25)):
     rows = []
 
+    vgs_min, vgs_max = vgs_good_range
+
     for vgs, grp in df.groupby("Vgs"):
+        if not (vgs_min <= vgs <= vgs_max):
+            continue
+
         sat = grp[grp["Vds"] >= vds_min_sat]
+        sat = sat[sat["Id"] > 1e-8]
+
         if len(sat) == 0:
             continue
+
         row = sat.loc[sat["Vds"].idxmax()]
-        rows.append(row[["Vgs", "Id", "Vds"]])
+        rows.append(row[["Vgs", "Id"]])
 
     sat_df = pd.DataFrame(rows).dropna()
-    sat_df = sat_df[sat_df["Id"] > 0]
-
+    
     vgs = sat_df["Vgs"].values
     ids = sat_df["Id"].values
+
     y = np.sqrt(ids)
 
     slope, intercept = np.polyfit(vgs, y, 1)
@@ -204,29 +231,134 @@ def extract_mos_sat_params(df: pd.DataFrame, vds_min_sat=1.0):
 
 
 # MOSFET – Early Voltage and channel resistance r_o
-def estimate_early_voltage(df: pd.DataFrame, vds_min_sat=1.0):
-    """
-    Fit Id = m*Vds + b in saturation region.
-    Extrapolate to Id=0 → intercept = -Va.
-    """
+def estimate_early_voltage_clean(df: pd.DataFrame,
+                                 vds_min_sat=2.0,
+                                 vgs_good_range=(0.25, 3.25)):
     vas = []
-    vgs_list = sorted(df["Vgs"].unique())
 
-    for vgs in vgs_list:
-        grp = df[(df["Vgs"] == vgs) & (df["Vds"] >= vds_min_sat)]
-        if len(grp) < 3:
+    vgs_min, vgs_max = vgs_good_range
+
+    for vgs, grp in df.groupby("Vgs"):
+        if not (vgs_min <= vgs <= vgs_max):
             continue
-        m, b = np.polyfit(grp["Vds"], grp["Id"], 1)
-        if m == 0:
+
+        sat = grp[grp["Vds"] >= vds_min_sat]
+        sat = sat[sat["Id"] > 1e-7]
+
+        if len(sat) < 4:
             continue
-        v_intercept = -b / m
-        vas.append(-v_intercept)
+
+        m, b = np.polyfit(sat["Vds"], sat["Id"], 1)
+        if m <= 0:
+            continue
+
+        v_intercept = -b/m
+        vas.append(v_intercept)
 
     return np.array(vas)
 
 
 def compute_ro_from_va(id_value, va):
     return va / id_value
+
+
+def extract_pmos_linear_params(df: pd.DataFrame,
+                               vds_max_linear=0.15,
+                               vgs_good_range=(-4.0, -1.0),
+                               min_points=3):
+
+    slopes = []
+    vgs_vals = []
+
+    vgs_min, vgs_max = vgs_good_range
+
+    for vgs, grp in df.groupby("Vgs"):
+        if not (vgs_min <= vgs <= vgs_max):
+            continue
+
+        # PMOS uses negative VDS → linear region is |Vds| small
+        lin = grp[np.abs(grp["Vds"]) <= vds_max_linear]
+
+        # PMOS currents small → allow |Id| > ~1e-12
+        lin = lin[np.abs(lin["Id"]) > 1e-12]
+
+        if len(lin) < min_points:
+            continue
+
+        m, b = np.polyfit(lin["Vds"], lin["Id"], 1)
+
+        slopes.append(m)
+        vgs_vals.append(vgs)
+
+    if len(slopes) < 2:
+        raise ValueError("PMOS: No valid slopes detected in linear region.")
+
+    slopes = np.array(slopes)
+    vgs_vals = np.array(vgs_vals)
+
+    # slope = k*(Vgs - Vt)
+    k_lin, intercept = np.polyfit(vgs_vals, slopes, 1)
+    vt_lin = -intercept / k_lin
+
+    return vt_lin, k_lin, vgs_vals, slopes
+
+
+def extract_pmos_sat_params(df: pd.DataFrame,
+                            vds_min_sat=2.0,
+                            vgs_good_range=(-4.0, -1.0)):
+    rows = []
+    vgs_min, vgs_max = vgs_good_range
+
+    for vgs, grp in df.groupby("Vgs"):
+        if not (vgs_min <= vgs <= vgs_max):
+            continue
+
+        sat = grp[np.abs(grp["Vds"]) >= vds_min_sat]
+        sat = sat[np.abs(sat["Id"]) > 1e-11]
+
+        if len(sat) == 0:
+            continue
+
+        row = sat.loc[sat["Vds"].abs().idxmax()]
+        rows.append(row[["Vgs", "Id"]])
+
+    sat_df = pd.DataFrame(rows).dropna()
+    ids = np.abs(sat_df["Id"].values)
+    vgs = sat_df["Vgs"].values
+
+    y = np.sqrt(ids)
+    slope, intercept = np.polyfit(vgs, y, 1)
+
+    vt_sat = -intercept / slope
+    k_sat = 2 * slope**2
+
+    return vt_sat, k_sat, vgs, ids
+
+
+def estimate_pmos_early_voltage(df: pd.DataFrame,
+                                vds_min_sat=2.0,
+                                vgs_good_range=(-4.0, -1.0)):
+    vas = []
+    vgs_min, vgs_max = vgs_good_range
+
+    for vgs, grp in df.groupby("Vgs"):
+        if not (vgs_min <= vgs <= vgs_max):
+            continue
+
+        sat = grp[np.abs(grp["Vds"]) >= vds_min_sat]
+        sat = sat[np.abs(sat["Id"]) > 1e-11]
+
+        if len(sat) < 4:
+            continue
+
+        m, b = np.polyfit(sat["Vds"], sat["Id"], 1)
+        if m == 0:
+            continue
+
+        v_intercept = -b / m
+        vas.append(v_intercept)
+
+    return np.array(vas)
 
 
 
@@ -299,3 +431,24 @@ if __name__ == "__main__":
     vas_nmos = estimate_early_voltage(nmos, vds_min_sat=1.0)
     print("\nNMOS Early voltages (per Vgs):", vas_nmos)
     print("NMOS Average Early voltage Va ≈", np.mean(vas_nmos))
+
+    vt_lin, k_lin, vgs_lin, slopes_lin = extract_mos_linear_params_clean(nmos)
+    vt_sat, k_sat, vgs_sat, ids_sat = extract_mos_sat_params_clean(nmos)
+    Va = estimate_early_voltage_clean(nmos)
+
+    print("CLEAN Vt_lin:", vt_lin)
+    print("CLEAN k_lin:", k_lin)
+    print("CLEAN Vt_sat:", vt_sat)
+    print("CLEAN k_sat:", k_sat)
+    print("CLEAN Early voltages:", Va)
+    print("Average Va:", np.mean(Va))
+
+    vt_lin, k_lin, vgs_lin, slopes_lin = extract_pmos_linear_params(pmos)
+    vt_sat, k_sat, vgs_sat, ids_sat = extract_pmos_sat_params(pmos)
+    Va = estimate_pmos_early_voltage(pmos)
+
+    print(vt_lin, k_lin)
+    print(vt_sat, k_sat)
+    print(Va, np.mean(Va))
+
+
